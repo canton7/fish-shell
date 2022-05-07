@@ -24,51 +24,63 @@
 #include "../wgetopt.h"
 #include "../wutil.h"  // IWYU pragma: keep
 
+#include <iostream>
+
 // builtin_complete_* are a set of rather silly looping functions that make sure that all the proper
 // combinations of complete_add or complete_remove get called. This is needed since complete allows
 // you to specify multiple switches on a single commandline, like 'complete -s a -s b -s c', but the
 // complete_add function only accepts one short switch and one long switch.
 
 /// Silly function.
-static void builtin_complete_add2(const wchar_t *cmd, bool cmd_is_path, const wchar_t *short_opt,
-                                  const wcstring_list_t &gnu_opts, const wcstring_list_t &old_opts,
-                                  completion_mode_t result_mode, const wchar_t *condition,
-                                  const wchar_t *comp, const wchar_t *desc, int flags) {
+static void builtin_complete_add2(const wchar_t *cmd, bool cmd_is_path, const wcstring &subcommand,
+                                  const wcstring &subcommand_selector,
+                                  const wchar_t *short_opt, const wcstring_list_t &gnu_opts,
+                                  const wcstring_list_t &old_opts, completion_mode_t result_mode, 
+                                  const wchar_t *condition, const wchar_t *comp,
+                                  const wchar_t *desc, int flags) {
     for (const wchar_t *s = short_opt; *s; s++) {
-        complete_add(cmd, cmd_is_path, wcstring{*s}, option_type_short, result_mode, condition,
+        complete_add(cmd, cmd_is_path, subcommand, wcstring{*s}, option_type_short, result_mode, condition,
                      comp, desc, flags);
     }
 
     for (const wcstring &gnu_opt : gnu_opts) {
-        complete_add(cmd, cmd_is_path, gnu_opt, option_type_double_long, result_mode, condition,
+        complete_add(cmd, cmd_is_path, subcommand, gnu_opt, option_type_double_long, result_mode, condition,
                      comp, desc, flags);
     }
 
     for (const wcstring &old_opt : old_opts) {
-        complete_add(cmd, cmd_is_path, old_opt, option_type_single_long, result_mode, condition,
+        complete_add(cmd, cmd_is_path, subcommand, old_opt, option_type_single_long, result_mode, condition,
                      comp, desc, flags);
     }
 
     if (old_opts.empty() && gnu_opts.empty() && short_opt[0] == L'\0') {
-        complete_add(cmd, cmd_is_path, wcstring(), option_type_args_only, result_mode, condition,
+        complete_add(cmd, cmd_is_path, subcommand, wcstring(), option_type_args_only, result_mode, condition,
                      comp, desc, flags);
     }
+
+    if (!subcommand_selector.empty()) {
+        complete_set_subcommand_selector(cmd, cmd_is_path, subcommand, subcommand_selector);
+    }
+
 }
 
 /// Silly function.
 static void builtin_complete_add(const wcstring_list_t &cmds, const wcstring_list_t &paths,
+                                 const wcstring_list_t &subcommands, const wcstring &subcommand_selector,
                                  const wchar_t *short_opt, const wcstring_list_t &gnu_opt,
                                  const wcstring_list_t &old_opt, completion_mode_t result_mode,
                                  const wchar_t *condition, const wchar_t *comp, const wchar_t *desc,
                                  int flags) {
-    for (const wcstring &cmd : cmds) {
-        builtin_complete_add2(cmd.c_str(), false /* not path */, short_opt, gnu_opt, old_opt,
-                              result_mode, condition, comp, desc, flags);
-    }
+    for (const wcstring &subcommand : subcommands) {
+        for (const wcstring &cmd : cmds) {
+            builtin_complete_add2(cmd.c_str(), false /* not path */, subcommand, subcommand_selector, short_opt, gnu_opt, old_opt,
+                                  result_mode, condition, comp, desc, flags);
+        }
 
-    for (const wcstring &path : paths) {
-        builtin_complete_add2(path.c_str(), true /* is path */, short_opt, gnu_opt, old_opt,
+        for (const wcstring &path : paths) {
+            builtin_complete_add2(path.c_str(), true /* is path */, subcommand, subcommand_selector, short_opt, gnu_opt, old_opt,
                               result_mode, condition, comp, desc, flags);
+        }
     }
 }
 
@@ -134,7 +146,8 @@ maybe_t<int> builtin_complete(parser_t &parser, io_streams_t &streams, const wch
     completion_mode_t result_mode{};
     int remove = 0;
     wcstring short_opt;
-    wcstring_list_t gnu_opt, old_opt, subcommand;
+    wcstring_list_t gnu_opt, old_opt, subcommands;
+    wcstring subcommand_selector;
     const wchar_t *comp = L"", *desc = L"", *condition = L"";
     bool do_complete = false;
     bool have_do_complete_param = false;
@@ -145,7 +158,7 @@ maybe_t<int> builtin_complete(parser_t &parser, io_streams_t &streams, const wch
     bool preserve_order = false;
     bool unescape_output = true;
 
-    static const wchar_t *const short_options = L":a:c:p:s:l:o:d:fFrxeuAn:C::w:hk";
+    static const wchar_t *const short_options = L":a:c:p:s:l:o:S:E:d:fFrxeuAn:C::w:hk";
     static const struct woption long_options[] = {
         {L"exclusive", no_argument, nullptr, 'x'},
         {L"no-files", no_argument, nullptr, 'f'},
@@ -157,6 +170,7 @@ maybe_t<int> builtin_complete(parser_t &parser, io_streams_t &streams, const wch
         {L"long-option", required_argument, nullptr, 'l'},
         {L"old-option", required_argument, nullptr, 'o'},
         {L"subcommand", required_argument, nullptr, 'S'},
+        {L"subcommand-selector", required_argument, nullptr, 'E'},
         {L"description", required_argument, nullptr, 'd'},
         {L"arguments", required_argument, nullptr, 'a'},
         {L"erase", no_argument, nullptr, 'e'},
@@ -247,9 +261,17 @@ maybe_t<int> builtin_complete(parser_t &parser, io_streams_t &streams, const wch
                 break;
             }
             case 'S': {
-                subcommand.push_back(w.woptarg);
+                subcommands.push_back(w.woptarg);
                 if (w.woptarg[0] == '\0') {
                     streams.err.append_format(_(L"%ls: -S requires a non-empty string\n"), cmd);
+                    return STATUS_INVALID_ARGS;
+                }
+                break;
+            }
+            case 'E': {
+                subcommand_selector = w.woptarg;
+                if (w.woptarg[0] == '\0') {
+                    streams.err.append_format(_(L"%ls: -E requires a non-empty string\n"), cmd);
                     return STATUS_INVALID_ARGS;
                 }
                 break;
@@ -417,8 +439,8 @@ maybe_t<int> builtin_complete(parser_t &parser, io_streams_t &streams, const wch
             parser.libdata().builtin_complete_current_commandline = false;
         }
     } else if (path.empty() && gnu_opt.empty() && short_opt.empty() && old_opt.empty() && !remove &&
-               !*comp && !*desc && !*condition && wrap_targets.empty() && !result_mode.no_files &&
-               !result_mode.force_files && !result_mode.requires_param) {
+               !*comp && !*desc && !*condition && wrap_targets.empty() && subcommand_selector.empty() &&
+               !result_mode.no_files && !result_mode.force_files && !result_mode.requires_param) {
         // No arguments that would add or remove anything specified, so we print the definitions of
         // all matching completions.
         if (cmd_to_complete.empty()) {
@@ -437,10 +459,14 @@ maybe_t<int> builtin_complete(parser_t &parser, io_streams_t &streams, const wch
             flags |= COMPLETE_DONT_SORT;
         }
 
+        if (subcommands.empty()) {
+            subcommands.push_back(wcstring());
+        }
+
         if (remove) {
             builtin_complete_remove(cmd_to_complete, path, short_opt.c_str(), gnu_opt, old_opt);
         } else {
-            builtin_complete_add(cmd_to_complete, path, short_opt.c_str(), gnu_opt, old_opt,
+            builtin_complete_add(cmd_to_complete, path, subcommands, subcommand_selector, short_opt.c_str(), gnu_opt, old_opt,
                                  result_mode, condition, comp, desc, flags);
         }
 

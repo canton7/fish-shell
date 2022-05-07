@@ -201,6 +201,9 @@ enum complete_option_type_t {
 void completions_sort_and_prioritize(completion_list_t *comps,
                                      completion_request_flags_t flags = {});
 
+void complete_set_subcommand_selector(const wchar_t *cmd, bool cmd_is_path,
+                                      const wcstring &subcommand, const wcstring &subcommand_selector);
+
 /// Add a completion.
 ///
 /// All supplied values are copied, they should be freed by or otherwise disposed by the caller.
@@ -232,7 +235,7 @@ void completions_sort_and_prioritize(completion_list_t *comps,
 /// \param condition a command to be run to check it this completion should be used. If \c condition
 /// is empty, the completion is always used.
 /// \param flags A set of completion flags
-void complete_add(const wchar_t *cmd, bool cmd_is_path, const wcstring &option,
+void complete_add(const wchar_t *cmd, bool cmd_is_path, const wcstring &subcommand, const wcstring &option,
                   complete_option_type_t option_type, completion_mode_t result_mode,
                   const wchar_t *condition, const wchar_t *comp, const wchar_t *desc, int flags);
 
