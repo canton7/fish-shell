@@ -53,15 +53,14 @@ static void builtin_complete_add2(const wchar_t *cmd, bool cmd_is_path, const wc
                      comp, desc, flags);
     }
 
-    if (old_opts.empty() && gnu_opts.empty() && short_opt[0] == L'\0') {
-        complete_add(cmd, cmd_is_path, subcommand, wcstring(), option_type_args_only, result_mode, condition,
-                     comp, desc, flags);
-    }
-
     if (!subcommand_selector.empty()) {
         complete_set_subcommand_selector(cmd, cmd_is_path, subcommand, subcommand_selector);
     }
 
+    if (old_opts.empty() && gnu_opts.empty() && short_opt[0] == L'\0' && subcommand_selector.empty()) {
+        complete_add(cmd, cmd_is_path, subcommand, wcstring(), option_type_args_only, result_mode, condition,
+                     comp, desc, flags);
+    }
 }
 
 /// Silly function.

@@ -128,24 +128,16 @@ static std::atomic<unsigned int> k_complete_order{0};
 
 /// Struct describing a command completion.
 using option_list_t = std::list<complete_entry_opt_t>;
-class completion_entry_t {
+class completion_entry_base_t {
    public:
     /// List of all options.
     option_list_t options;
 
-    /// Command string.
-    const wcstring cmd;
-    /// True if command is a path.
-    const bool cmd_is_path;
-    /// Subcommand string (if any).
-    const wcstring subcommand;
-
     wcstring subcommand_selector;
-
+    
     /// Order for when this completion was created. This aids in outputting completions sorted by
     /// time.
     const unsigned int order;
-
     /// Getters for option list.
     const option_list_t &get_options() const { return options; }
 
@@ -153,14 +145,28 @@ class completion_entry_t {
     void add_option(const complete_entry_opt_t &opt) { options.push_front(opt); }
     bool remove_option(const wcstring &option, complete_option_type_t type);
 
-    completion_entry_t(wcstring c, bool type, wcstring subcommand)
-        : cmd(std::move(c)), cmd_is_path(type), subcommand(std::move(subcommand)), order(++k_complete_order) {}
+    completion_entry_base_t() : order(++k_complete_order) {}
+};
+
+class completion_subcommand_entry_t : public completion_entry_base_t {};
+
+class completion_entry_t : public completion_entry_base_t {
+   public:
+    /// Command string.
+    const wcstring cmd;
+    /// True if command is a path.
+    const bool cmd_is_path;
+
+    std::map<wcstring, completion_subcommand_entry_t> subcommands;
+
+    completion_entry_t(wcstring c, bool type)
+        : cmd(std::move(c)), cmd_is_path(type) {}
 };
 
 /// Remove all completion options in the specified entry that match the specified short / long
 /// option strings. Returns true if it is now empty and should be deleted, false if it's not empty.
 /// Must be called while locked.
-bool completion_entry_t::remove_option(const wcstring &option, complete_option_type_t type) {
+bool completion_entry_base_t::remove_option(const wcstring &option, complete_option_type_t type) {
     auto iter = this->options.begin();
     while (iter != this->options.end()) {
         if (iter->option == option && iter->type == type) {
@@ -179,15 +185,14 @@ namespace std {
 template <>
 struct hash<completion_entry_t> {
     size_t operator()(const completion_entry_t &c) const {
-        std::hash<wcstring> cmdhasher;
-        std::hash<wcstring> subcmdhasher;
-        return cmdhasher(wcstring(c.cmd)) ^ subcmdhasher(wcstring(c.subcommand));
+        std::hash<wcstring> hasher;
+        return hasher(wcstring(c.cmd));
     }
 };
 template <>
 struct equal_to<completion_entry_t> {
     bool operator()(const completion_entry_t &c1, const completion_entry_t &c2) const {
-        return c1.cmd == c2.cmd && c1.subcommand == c2.subcommand;
+        return c1.cmd == c2.cmd;
     }
 };
 
@@ -397,12 +402,11 @@ class completer_t {
     bool try_complete_variable(const wcstring &str);
     bool try_complete_user(const wcstring &str);
 
-    void load_all_completion_options(const completion_entry_set_t &completion_set, const wcstring &cmd,
-                                     const wcstring &path, const wcstring &subcommand,
-                                     std::vector<option_list_t> &all_options);
+    void load_subcommand_completion_options(const completion_entry_t &completion_entry,
+                                            const wcstring &subcommand_selector,
+                                            std::vector<option_list_t> &all_options);
     bool complete_param_for_command(const wcstring &cmd_orig, const wcstring &popt,
-                                    const wcstring &str, bool use_switches, const wcstring &subcommand,
-                                    bool *out_do_file);
+                                    const wcstring &str, bool use_switches, bool *out_do_file);
 
     void complete_param_expand(const wcstring &str, bool do_file,
                                bool handle_as_special_cd = false);
@@ -516,14 +520,19 @@ bool completer_t::condition_test(const wcstring &condition) {
 }
 
 /// Locate the specified entry. Create it if it doesn't exist. Must be called while locked.
-static completion_entry_t &complete_get_exact_entry(completion_entry_set_t &completion_set,
-                                                    const wcstring &cmd, bool cmd_is_path, const wcstring &subcommand) {
-    auto ins = completion_set.emplace(cmd, cmd_is_path, subcommand);
-
+static completion_entry_base_t &complete_get_exact_entry(completion_entry_set_t &completion_set,
+                                                         const wcstring &cmd, bool cmd_is_path,
+                                                         const wcstring &subcommand) {
+    auto ins = completion_set.emplace(cmd, cmd_is_path);
     // NOTE SET_ELEMENTS_ARE_IMMUTABLE: Exposing mutable access here is only okay as long as callers
     // do not change any field that matters to ordering - affecting order without telling std::set
     // invalidates its internal state.
-    return const_cast<completion_entry_t &>(*ins.first);
+    completion_entry_t &completion_entry = const_cast<completion_entry_t &>(*ins.first);
+    if (!subcommand.empty()) {
+        return const_cast<completion_subcommand_entry_t &>(completion_entry.subcommands[subcommand]);
+    }
+
+    return completion_entry;
 }
 
 /// Find the full path and commandname from a command string 'str'.
@@ -881,20 +890,21 @@ static void complete_load(const wcstring &name) {
     }
 }
 
-void completer_t::load_all_completion_options(const completion_entry_set_t &completion_set, const wcstring &cmd,
-                                              const wcstring &path, const wcstring &subcommand,
-                                              std::vector<option_list_t> &all_options) {
-    for (const completion_entry_t &i : completion_set) {
-        const wcstring &match = i.cmd_is_path ? path : cmd;
-        if (wildcard_match(match, i.cmd) && i.subcommand == subcommand) {
-            // Copy all of their options into our list.
-            all_options.push_back(i.get_options());  // Oof, this is a lot of copying
-
-            if (!i.subcommand_selector.empty()) {
-                wcstring_list_t outputs;
-                (void)exec_subshell(i.subcommand_selector, *ctx.parser, outputs, false /* don't apply exit status */);
-                for (const wcstring &output : outputs) {
-                    load_all_completion_options(completion_set, cmd, path, output, all_options);
+void completer_t::load_subcommand_completion_options(const completion_entry_t &completion_entry,
+                                                     const wcstring &subcommand_selector,
+                                                     std::vector<option_list_t> &all_options) {
+    // TODO: Recursion limits
+    wcstring_list_t outputs;
+    // TODO: This fails when called from a background thread
+    (void)exec_subshell(subcommand_selector, *ctx.parser, outputs, false /* don't apply exit status */);
+    for (const wcstring &output : outputs) {
+        if (!output.empty()) {
+            auto it = completion_entry.subcommands.find(output);
+            if (it != completion_entry.subcommands.end()) {
+                const completion_subcommand_entry_t &subcommand_entry = it->second;
+                all_options.push_back(subcommand_entry.get_options());
+                if (!subcommand_entry.subcommand_selector.empty()) {
+                    load_subcommand_completion_options(completion_entry, subcommand_entry.subcommand_selector, all_options);
                 }
             }
         }
@@ -913,7 +923,7 @@ void completer_t::load_all_completion_options(const completion_entry_set_t &comp
 ///
 bool completer_t::complete_param_for_command(const wcstring &cmd_orig, const wcstring &popt,
                                              const wcstring &str, bool use_switches,
-                                             const wcstring &subcommand, bool *out_do_file) {
+                                             bool *out_do_file) {
     bool use_common = true, use_files = true, has_force = false;
 
     wcstring cmd, path;
@@ -945,7 +955,17 @@ bool completer_t::complete_param_for_command(const wcstring &cmd_orig, const wcs
     std::vector<option_list_t> all_options;
     {
         auto completion_set = s_completion_set.acquire();
-        load_all_completion_options(*completion_set, cmd, path, subcommand, all_options);
+        for (const completion_entry_t &i : *completion_set) {
+            const wcstring &match = i.cmd_is_path ? path : cmd;
+            if (wildcard_match(match, i.cmd)) {
+                // Copy all of their options into our list.
+                all_options.push_back(i.get_options());  // Oof, this is a lot of copying
+
+                if (!i.subcommand_selector.empty()) {
+                    load_subcommand_completion_options(i, i.subcommand_selector, all_options);
+                }
+            }
+        }
     }
 
     // Now release the lock and test each option that we captured above. We have to do this outside
@@ -1428,7 +1448,7 @@ void completer_t::complete_custom(const wcstring &cmd, const wcstring &cmdline,
 
     if (!complete_param_for_command(
             cmd, ad->previous_argument, ad->current_argument, !ad->had_ddash,
-            wcstring(), &ad->do_file)) {  // Invoke any custom completions for this command.
+            &ad->do_file)) {  // Invoke any custom completions for this command.
     }
 }
 
@@ -1762,7 +1782,7 @@ void complete_set_subcommand_selector(const wchar_t *cmd, bool cmd_is_path,
 
     // Lock the lock that allows us to edit the completion entry list.
     auto completion_set = s_completion_set.acquire();
-    completion_entry_t &c = complete_get_exact_entry(*completion_set, cmd, cmd_is_path, subcommand);
+    completion_entry_base_t &c = complete_get_exact_entry(*completion_set, cmd, cmd_is_path, subcommand);
 
     c.subcommand_selector = subcommand_selector;
 }
@@ -1777,7 +1797,7 @@ void complete_add(const wchar_t *cmd, bool cmd_is_path, const wcstring &subcomma
 
     // Lock the lock that allows us to edit the completion entry list.
     auto completion_set = s_completion_set.acquire();
-    completion_entry_t &c = complete_get_exact_entry(*completion_set, cmd, cmd_is_path, subcommand);
+    completion_entry_base_t &c = complete_get_exact_entry(*completion_set, cmd, cmd_is_path, subcommand);
 
     // Create our new option.
     complete_entry_opt_t opt;
@@ -1798,7 +1818,7 @@ void complete_remove(const wcstring &cmd, bool cmd_is_path, const wcstring &opti
     auto completion_set = s_completion_set.acquire();
 
     // TODO
-    completion_entry_t tmp_entry(cmd, cmd_is_path, wcstring());
+    completion_entry_t tmp_entry(cmd, cmd_is_path);
     auto iter = completion_set->find(tmp_entry);
     if (iter != completion_set->end()) {
         // const_cast: See SET_ELEMENTS_ARE_IMMUTABLE.
@@ -1814,7 +1834,7 @@ void complete_remove(const wcstring &cmd, bool cmd_is_path, const wcstring &opti
 void complete_remove_all(const wcstring &cmd, bool cmd_is_path) {
     auto completion_set = s_completion_set.acquire();
     // TODO
-    completion_entry_t tmp_entry(cmd, cmd_is_path, wcstring());
+    completion_entry_t tmp_entry(cmd, cmd_is_path);
     completion_set->erase(tmp_entry);
 }
 
@@ -1846,6 +1866,25 @@ static void append_switch(wcstring &out, const wcstring &opt) {
     append_format(out, L" --%ls", opt.c_str());
 }
 
+static wcstring completion_subcommand_selector2string(const wcstring &cmd, bool is_path,
+                                                      const wcstring &subcommand, const wcstring &subcommand_selector) {
+    wcstring out;
+    out.append(L"complete");
+
+    if (is_path)
+        append_switch(out, L'p', cmd);
+    else {
+        out.append(L" ");
+        out.append(escape_string(cmd, ESCAPE_ALL));
+    }
+
+    append_switch(out, L'S', subcommand);
+    append_switch(out, L'E', subcommand_selector);
+
+    out.append(L"\n");
+    return out;
+}
+
 static wcstring completion2string(const complete_entry_opt_t &o, const wcstring &cmd,
                                   bool is_path, const wcstring &subcommand) {
     wcstring out;
@@ -1870,9 +1909,7 @@ static wcstring completion2string(const complete_entry_opt_t &o, const wcstring 
         out.append(escape_string(cmd, ESCAPE_ALL));
     }
 
-    if (!subcommand.empty()) {
-        append_switch(out, L'S', subcommand);
-    }
+    append_switch(out, L'S', subcommand);
 
     switch (o.type) {
         case option_type_args_only: {
@@ -1910,24 +1947,20 @@ wcstring complete_print(const wcstring &cmd) {
 
     for (const completion_entry_t &e : all_completions) {
         if (!cmd.empty() && e.cmd != cmd) continue;
-        // TODO: Duplication
         if (!e.subcommand_selector.empty()) {
-            out.append(L"complete");
-            if (e.cmd_is_path)
-                append_switch(out, L'p', e.cmd);
-            else {
-                out.append(L" ");
-                out.append(escape_string(e.cmd, ESCAPE_ALL));
-            }
-            if (!e.subcommand.empty()) {
-                append_switch(out, L'S', e.subcommand);
-            }
-            append_switch(out, L'E', e.subcommand_selector);
-            out.append(L"\n");
+            out.append(completion_subcommand_selector2string(e.cmd, e.cmd_is_path, wcstring(), e.subcommand_selector));
         }
         const option_list_t &options = e.get_options();
         for (const complete_entry_opt_t &o : options) {
-            out.append(completion2string(o, e.cmd, e.cmd_is_path, e.subcommand));
+            out.append(completion2string(o, e.cmd, e.cmd_is_path, wcstring()));
+        }
+        for (const auto &it : e.subcommands) {
+            if (!it.second.subcommand_selector.empty()) {
+                out.append(completion_subcommand_selector2string(e.cmd, e.cmd_is_path, it.first, it.second.subcommand_selector));
+            }
+            for (const complete_entry_opt_t &o : it.second.get_options()) {
+                out.append(completion2string(o, e.cmd, e.cmd_is_path, it.first));
+            }
         }
     }
 
